@@ -1,13 +1,23 @@
+import sys
+import subprocess
 import time
 import pandas as pd
 import streamlit as st
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
+from playwright.sync_api import sync_playwright
 
 st.set_page_config(page_title="Tour Scraper", layout="centered")
 st.title("Tour Data Scraper")
+
+@st.cache_resource
+def install_playwright_browser():
+    """Install Playwright's bundled Chromium (runs once, cached for the session)."""
+    subprocess.run(
+        [sys.executable, "-m", "playwright", "install", "chromium"],
+        check=True,
+        capture_output=True
+    )
+
+install_playwright_browser()
 
 # 1. UI Input Fields
 country_url = st.text_input("Target URL", "https://opatrip.com/search-results?q=USA")
@@ -15,54 +25,51 @@ country_file_name = st.text_input("Output File Name (without .csv)", "USA_File")
 
 # 2. Action Button
 if st.button("Start Scraping"):
-    # This status box keeps your teammates updated without looking at a terminal
     with st.status("Initializing scraper...", expanded=True) as status:
         st.write("Configuring headless browser...")
-        
-        # Streamlit Cloud headless Chrome configuration
-        chrome_options = Options()
-        chrome_options.binary_location = "/usr/bin/chromium"
-        chrome_options.add_argument("--headless=new")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        service = Service("/usr/bin/chromedriver")
-        driver = webdriver.Chrome(service=service, options=chrome_options)
 
         try:
             st.write(f"Loading page: {country_url}")
-            driver.get(country_url)
-            time.sleep(5)
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(country_url, timeout=60000)
+                page.wait_for_timeout(5000)
 
-            st.write("Clicking 'Show more' until all tours are loaded...")
-            while True:
-                try:
-                    show_more_btn = driver.find_element(By.XPATH, "//span[contains(text(), 'Show more')]")
-                    driver.execute_script("arguments[0].click();", show_more_btn)
-                    time.sleep(3)
-                except:
-                    st.write("No more 'Show more' buttons found. Ready to extract!")
-                    break
+                st.write("Clicking 'Show more' until all tours are loaded...")
+                while True:
+                    try:
+                        show_more = page.locator("span:text('Show more')")
+                        if show_more.count() > 0:
+                            show_more.first.click()
+                            page.wait_for_timeout(3000)
+                        else:
+                            st.write("No more 'Show more' buttons found. Ready to extract!")
+                            break
+                    except Exception:
+                        st.write("No more 'Show more' buttons found. Ready to extract!")
+                        break
 
-            st.write("Extracting tour titles and cities...")
-            cards = driver.find_elements(By.XPATH, "//a[.//h3[contains(@class, 'font-bold')]]")
+                st.write("Extracting tour titles and cities...")
+                cards = page.locator("a:has(h3.font-bold)")
+                count = cards.count()
 
-            data = []
-            for card in cards:
-                try:
-                    title = card.find_element(By.CSS_SELECTOR, "h3.text-body.font-bold").text.strip()
-                    city = card.find_element(By.CSS_SELECTOR, "span.text-sm.text-brand").text.strip()
+                data = []
+                for i in range(count):
+                    try:
+                        card = cards.nth(i)
+                        title = card.locator("h3.text-body.font-bold").text_content()
+                        city  = card.locator("span.text-sm.text-brand").text_content()
+                        if title and title.strip():
+                            data.append({
+                                "Country Name": "USA",  # Note: kept per original script
+                                "City Name": city.strip() if city else "",
+                                "Tour Title": title.strip()
+                            })
+                    except Exception:
+                        continue
 
-                    if title:
-                        data.append({
-                            "Country Name": "USA", # Note: Kept hardcoded per your original script
-                            "City Name": city,
-                            "Tour Title": title
-                        })
-                except:
-                    continue
-
-            driver.quit()
+                browser.close()
 
             # 3. Clean and Export
             if len(data) == 0:
@@ -71,12 +78,10 @@ if st.button("Start Scraping"):
             else:
                 df = pd.DataFrame(data)
                 df.drop_duplicates(subset=['Tour Title'], inplace=True)
-                
-                # Convert DataFrame to CSV string for Streamlit's download button
                 csv_data = df.to_csv(index=False).encode('utf-8')
-                
+
                 status.update(label=f"Extraction complete! {len(df)} tours found.", state="complete", expanded=False)
-                
+
                 # 4. Auto-Download UI
                 st.success("Scraping finished successfully!")
                 st.download_button(
@@ -86,8 +91,7 @@ if st.button("Start Scraping"):
                     mime="text/csv",
                     type="primary"
                 )
-                
+
         except Exception as e:
             status.update(label="Scraping failed.", state="error", expanded=False)
             st.error(f"An error occurred: {e}")
-            driver.quit()
